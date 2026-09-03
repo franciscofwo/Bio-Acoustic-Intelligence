@@ -1,0 +1,303 @@
+#include <Arduino.h>
+#include <driver/i2s.h>
+#include <math.h>
+
+// ============================================================================
+// Captura de áudio (INMP441 -> ESP32-S3 N16R8) + métricas no tempo
+// (RMS, Peak, Crest, ZCR) + MFCC_1..MFCC_13 no domínio da frequência.
+// ============================================================================
+
+// ---- Pinos para ESP32-S3 N16R8 (evita GPIO26-37, 0, 19, 20, 45, 46) ----
+#define I2S_WS_PIN   5    // Word Select / LRCLK
+#define I2S_SCK_PIN  4    // Bit Clock / BCLK
+#define I2S_SD_PIN   6    // Serial Data / DOUT do microfone
+
+#define I2S_PORT     I2S_NUM_0
+#define SAMPLE_RATE  16000
+#define SAMPLE_BITS  I2S_BITS_PER_SAMPLE_32BIT
+#define BUFFER_LEN   512          // 512 amostras @16kHz = 32ms por janela
+
+// ---- Parâmetros do pipeline de MFCC ----
+#define FFT_SIZE         BUFFER_LEN   // reaproveita a mesma janela (precisa ser potência de 2)
+#define NUM_MEL_FILTERS  26           // bancos de filtro mel (típico: 20-40)
+#define NUM_MFCC         13           // coeficientes finais mantidos após a DCT
+#define PRE_EMPHASIS     0.97f        // realça altas frequências antes da FFT
+
+int32_t samplesBuffer[BUFFER_LEN];    // buffer bruto vindo do I2S (frames de 32 bits)
+
+float rawSamples[FFT_SIZE];           // amostras realinhadas (>>8), SEM janela - usadas p/ RMS/Peak/Crest/ZCR
+float fftReal[FFT_SIZE];              // buffer de trabalho da FFT (parte real)
+float fftImag[FFT_SIZE];              // buffer de trabalho da FFT (parte imaginária)
+float hammingWindow[FFT_SIZE];        // janela de Hamming, pré-calculada uma vez no setup()
+int   melBinPoints[NUM_MEL_FILTERS + 2]; // bordas dos filtros mel, em índice de bin da FFT
+float mfccCoefficients[NUM_MFCC];     // resultado final: MFCC_1..MFCC_13 da janela atual
+
+struct AudioMetrics {
+  float rms;
+  float peak;
+  float crestFactor;
+  float zcrPerSecond;
+  float db;
+};
+
+// ---------------------------------------------------------------------------
+// Configuração do I2S (idêntica à versão anterior - já validada com o seu mic)
+// ---------------------------------------------------------------------------
+void setupI2SMic() {
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = SAMPLE_BITS,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT, // pegadinha do INMP441 com o driver legado
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = BUFFER_LEN,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK_PIN,
+    .ws_io_num = I2S_WS_PIN,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD_PIN
+  };
+
+  esp_err_t err;
+  err = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  if (err != ESP_OK) Serial.printf("ERRO em i2s_driver_install: %d (%s)\n", err, esp_err_to_name(err));
+
+  err = i2s_set_pin(I2S_PORT, &pin_config);
+  if (err != ESP_OK) Serial.printf("ERRO em i2s_set_pin: %d (%s)\n", err, esp_err_to_name(err));
+
+  i2s_zero_dma_buffer(I2S_PORT);
+}
+
+float rmsToDb(float rms) {
+  if (rms < 1.0f) rms = 1.0f;
+  return 20.0f * log10f(rms);
+}
+
+// ---------------------------------------------------------------------------
+// Métricas no domínio do tempo - RMS, pico, fator de crista e ZCR.
+// Trabalha em cima das amostras JÁ realinhadas (rawSamples), sem I2S nem
+// janela aplicada - mesma lógica da versão anterior, só que recebendo o
+// array pronto em vez de ler o I2S ela mesma.
+// ---------------------------------------------------------------------------
+AudioMetrics analyzeTimeDomain(float* samples, int count) {
+  AudioMetrics m = {0, 0, 0, 0, 0};
+  if (count <= 1) return m;
+
+  double sumSquares = 0.0;
+  float peakAbs = 0.0f;
+  int zeroCrossings = 0;
+  float prevSample = samples[0];
+
+  for (int i = 0; i < count; i++) {
+    float sample = samples[i];
+    sumSquares += (double)sample * (double)sample;
+
+    float absSample = fabsf(sample);
+    if (absSample > peakAbs) peakAbs = absSample;
+
+    if (i > 0) {
+      bool prevPositive = (prevSample >= 0);
+      bool currPositive = (sample >= 0);
+      if (prevPositive != currPositive) zeroCrossings++;
+    }
+    prevSample = sample;
+  }
+
+  double meanSquare = sumSquares / count;
+  m.rms = sqrt(meanSquare);
+  m.peak = peakAbs;
+  m.crestFactor = (m.rms > 0.0f) ? (m.peak / m.rms) : 0.0f;
+  m.zcrPerSecond = (float)zeroCrossings * SAMPLE_RATE / count;
+  m.db = rmsToDb(m.rms);
+  return m;
+}
+
+// ---------------------------------------------------------------------------
+// FFT iterativa radix-2 (Cooley-Tukey, in-place). FFT_SIZE precisa ser
+// potência de 2 - com BUFFER_LEN = 512 isso já é garantido.
+// ---------------------------------------------------------------------------
+void fft(float* real, float* imag, int n) {
+  // Permutação bit-reversa
+  for (int i = 1, j = 0; i < n; i++) {
+    int bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      float tr = real[i]; real[i] = real[j]; real[j] = tr;
+      float ti = imag[i]; imag[i] = imag[j]; imag[j] = ti;
+    }
+  }
+
+  // Borboletas Cooley-Tukey
+  for (int len = 2; len <= n; len <<= 1) {
+    float ang = -2.0f * PI / len;
+    float wlr = cosf(ang), wli = sinf(ang);
+    for (int i = 0; i < n; i += len) {
+      float wr = 1.0f, wi = 0.0f;
+      for (int k = 0; k < len / 2; k++) {
+        float ur = real[i + k], ui = imag[i + k];
+        float vr = real[i + k + len / 2] * wr - imag[i + k + len / 2] * wi;
+        float vi = real[i + k + len / 2] * wi + imag[i + k + len / 2] * wr;
+
+        real[i + k] = ur + vr;
+        imag[i + k] = ui + vi;
+        real[i + k + len / 2] = ur - vr;
+        imag[i + k + len / 2] = ui - vi;
+
+        float nwr = wr * wlr - wi * wli;
+        wi = wr * wli + wi * wlr;
+        wr = nwr;
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pré-calcula a janela de Hamming (chamado uma vez, no setup)
+// ---------------------------------------------------------------------------
+void setupHammingWindow() {
+  for (int i = 0; i < FFT_SIZE; i++) {
+    hammingWindow[i] = 0.54f - 0.46f * cosf(2.0f * PI * i / (FFT_SIZE - 1));
+  }
+}
+
+float hzToMel(float hz) { return 2595.0f * log10f(1.0f + hz / 700.0f); }
+float melToHz(float mel) { return 700.0f * (powf(10.0f, mel / 2595.0f) - 1.0f); }
+
+// ---------------------------------------------------------------------------
+// Pré-calcula as bordas do banco de filtros mel, em índice de bin da FFT
+// (chamado uma vez, no setup - não depende do áudio, só da taxa de amostragem)
+// ---------------------------------------------------------------------------
+void setupMelFilterbank() {
+  float lowMel = hzToMel(0.0f);
+  float highMel = hzToMel(SAMPLE_RATE / 2.0f);
+
+  for (int i = 0; i < NUM_MEL_FILTERS + 2; i++) {
+    float mel = lowMel + (highMel - lowMel) * i / (NUM_MEL_FILTERS + 1);
+    float hz = melToHz(mel);
+    melBinPoints[i] = (int)floorf((FFT_SIZE + 1) * hz / SAMPLE_RATE);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Banco de filtros mel (energia log por filtro) + DCT -> MFCC_1..MFCC_13
+// ---------------------------------------------------------------------------
+void computeMelAndDCT(float* real, float* imag, float* mfccOut) {
+  float melEnergies[NUM_MEL_FILTERS];
+
+  for (int m = 1; m <= NUM_MEL_FILTERS; m++) {
+    int startBin = melBinPoints[m - 1];
+    int centerBin = melBinPoints[m];
+    int endBin = melBinPoints[m + 1];
+    float energy = 0.0f;
+
+    // rampa de subida do filtro triangular
+    for (int k = startBin; k < centerBin; k++) {
+      if (k < 0 || k > FFT_SIZE / 2) continue;
+      float weight = (centerBin == startBin) ? 0.0f : (float)(k - startBin) / (centerBin - startBin);
+      float power = real[k] * real[k] + imag[k] * imag[k];
+      energy += weight * power;
+    }
+    // rampa de descida do filtro triangular
+    for (int k = centerBin; k < endBin; k++) {
+      if (k < 0 || k > FFT_SIZE / 2) continue;
+      float weight = (endBin == centerBin) ? 0.0f : (float)(endBin - k) / (endBin - centerBin);
+      float power = real[k] * real[k] + imag[k] * imag[k];
+      energy += weight * power;
+    }
+
+    melEnergies[m - 1] = logf(energy + 1e-6f); // epsilon evita log(0)
+  }
+
+  // DCT-II, mantendo só os NUM_MFCC primeiros coeficientes (os que carregam
+  // o formato geral do espectro - os de ordem alta seriam descartados)
+  for (int c = 0; c < NUM_MFCC; c++) {
+    float sum = 0.0f;
+    for (int n = 0; n < NUM_MEL_FILTERS; n++) {
+      sum += melEnergies[n] * cosf((PI / NUM_MEL_FILTERS) * (n + 0.5f) * c);
+    }
+    mfccOut[c] = sum;
+  }
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  setupI2SMic();
+  setupHammingWindow();
+  setupMelFilterbank();
+  Serial.println("Microfone I2S inicializado (ESP32-S3 N16R8) - RMS/Peak/Crest/ZCR + MFCC_1..13");
+}
+
+void loop() {
+  size_t bytesRead = 0;
+  i2s_read(I2S_PORT, samplesBuffer, sizeof(samplesBuffer), &bytesRead, portMAX_DELAY);
+  int samplesRead = bytesRead / sizeof(int32_t);
+  if (samplesRead <= 1) { delay(200); return; }
+
+  // Realinha os 24 bits úteis (bits altos do frame de 32 bits) UMA vez só;
+  // esse array alimenta tanto as métricas no tempo quanto o pipeline de MFCC.
+  for (int i = 0; i < FFT_SIZE; i++) {
+    rawSamples[i] = (i < samplesRead) ? (float)(samplesBuffer[i] >> 8) : 0.0f;
+  }
+
+  // --- Métricas no tempo (sem janela, sem pré-ênfase - amostras "cruas") ---
+  AudioMetrics m = analyzeTimeDomain(rawSamples, samplesRead);
+
+  // --- Pipeline espectral: pré-ênfase + janela de Hamming, só pra FFT/MFCC ---
+  float prev = 0.0f;
+  for (int i = 0; i < FFT_SIZE; i++) {
+    float emphasized = rawSamples[i] - PRE_EMPHASIS * prev;
+    prev = rawSamples[i];
+    fftReal[i] = emphasized * hammingWindow[i];
+    fftImag[i] = 0.0f;
+  }
+
+  fft(fftReal, fftImag, FFT_SIZE);
+  computeMelAndDCT(fftReal, fftImag, mfccCoefficients);
+
+  // --- Saída: formato Label:valor separado por vírgula (compatível com o
+  // Serial Plotter do Arduino IDE e com os web plotters) ---
+  Serial.print("RMS:");    Serial.print(m.rms, 2);
+  Serial.print(",Peak:");  Serial.print(m.peak, 2);
+  Serial.print(",Crest:"); Serial.print(m.crestFactor, 2);
+  Serial.print(",ZCR_Hz:");Serial.print(m.zcrPerSecond, 1);
+  Serial.print(",dB:");    Serial.print(m.db, 2);
+  for (int c = 0; c < NUM_MFCC; c++) {
+    Serial.print(",MFCC_"); Serial.print(c + 1);
+    Serial.print(":");      Serial.print(mfccCoefficients[c], 3);
+  }
+  Serial.println();
+
+  delay(200);
+}
+
+
+#include <Arduino.h>
+
+float soma(float a, float b) {
+  float resultado = a + b;
+  Serial.print("Soma: ");
+  Serial.println(resultado);
+  return resultado;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+}
+
+void loop() {
+  soma(3.5, 2.1);
+  delay(2000); // espera 2 segundos antes de repetir
+}
+
+
