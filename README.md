@@ -1,2 +1,2 @@
 # Bio-Acoustic-Intelligence
-Inicitiavita voltada para aolicar tecnologia e inovação a fim desenvolver soluções tecnológicas que apoiem ESG..
+Iniciiatita voluntária voltada para aplicar tecnologia e inovação a fim desenvolver soluções tecnológicas que apoiem ESG..
