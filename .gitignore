@@ -3,3 +3,11 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# modelos treinados são artefato reproduzível (via ml/train.py), não código-fonte
+ml/models/*.joblib
+!ml/models/.gitkeep
+
+# ambientes virtuais Python locais
+ml/.venv/
+ml/__pycache__/
